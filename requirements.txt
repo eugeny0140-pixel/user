@@ -1,1 +1,1 @@
-
+python-telegram-botfeedparserscheduleflaskdeep-translatorbeautifulsoup4python-dotenvgunicornsupabase
