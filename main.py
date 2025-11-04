@@ -1,347 +1,389 @@
+# bot.py
 import os
 import re
 import time
 import logging
+import requests
 import json
-import threading
-from urllib.parse import urlparse
-
-import feedparser
-import schedule
-import telegram
-from flask import Flask
-from deep_translator import GoogleTranslator, MyMemoryTranslator
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from supabase import create_client, Client # <<< НОВОЕ: импорт Supabase
+from deep_translator import GoogleTranslator, MyMemoryTranslator
+import schedule
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+import html
+import traceback
+from db_supabase import is_seen, mark_seen
 
-# --- 1. Конфигурация ---
-load_dotenv()
+# ================== НАСТРОЙКИ ==================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@time_n_John")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Учетные данные Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_IDS = [cid for cid in [os.getenv("CHANNEL_ID1"), os.getenv("CHANNEL_ID2")] if cid]
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN не задан")
 
-# Учетные данные Supabase (будут в Render Environment)
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-# Порт
-PORT = int(os.getenv("PORT", 10000))
-
-# --- 2. Настройка логирования ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
-)
-logging.getLogger("schedule").setLevel(logging.WARN)
-logging.getLogger("urllib3").setLevel(logging.WARN)
-logging.getLogger("httpx").setLevel(logging.WARN) # <<< НОВОЕ: убираем лишний лог от Supabase
-
-# --- 3. Константы: Источники и Ключевые слова ---
-# (Оставляем KEYWORDS_RAW и SOURCES как в прошлый раз)
-# ... (здесь ваш ОГРОМНЫЙ список KEYWORDS_RAW) ...
-KEYWORDS_RAW = [
-    r"\brussia\b", r"\brussian\b", r"\bputin\b", r"\bmoscow\b", r"\bkremlin\b",
-    r"\bukraine\b", r"\bukrainian\b", r"\bzelensky\b", r"\bkyiv\b", r"\bkiev\b",
-    r"\bcrimea\b", r"\bdonbas\b", r"\bsanction[s]?\b", r"\bgazprom\b",
-    r"\bnord\s?stream\b", r"\bwagner\b", r"\blavrov\b", r"\bshoigu\b",
-    r"\bmedvedev\b", r"\bpeskov\b", r"\bnato\b", r"\beuropa\b", r"\busa\b",
-    r"\bsoviet\b", r"\bussr\b", r"\bpost\W?soviet\b",
-    # === СВО и Война ===
-    r"\bsvo\b", r"\bспецоперация\b", r"\bspecial military operation\b",
-    r"\bвойна\b", r"\bwar\b", r"\bconflict\b", r"\bконфликт\b",
-    r"\bнаступление\b", r"\boffensive\b", r"\bатака\b", r"\battack\b",
-    r"\bудар\b", r"\bstrike\b", r"\bобстрел\b", r"\bshelling\b",
-    r"\bдрон\b", r"\bdrone\b", r"\bmissile\b", r"\bракета\b",
-    r"\bэскалация\b", r"\bescalation\b", r"\bмобилизация\b", r"\bmobilization\b",
-    r"\bфронт\b", r"\bfrontline\b", r"\bзахват\b", r"\bcapture\b",
-    r"\bосвобождение\b", r"\bliberation\b", r"\bбой\b", r"\bbattle\b",
-    r"\bпотери\b", r"\bcasualties\b", r"\bпогиб\b", r"\bkilled\b",
-    r"\bранен\b", r"\binjured\b", r"\bпленный\b", r"\bprisoner of war\b",
-    r"\bпереговоры\b", r"\btalks\b", r"\bперемирие\b", r"\bceasefire\b",
-    r"\bсанкции\b", r"\bsanctions\b", r"\bоружие\b", r"\bweapons\b",
-    r"\bпоставки\b", r"\bsupplies\b", r"\bhimars\b", r"\batacms\b",
-    r"\bhour ago\b", r"\bчас назад\b", r"\bminutos atrás\b", r"\b小时前\b",
-    # === Криптовалюта (топ-20 + CBDC, DeFi, регуляция) ===
-    r"\bbitcoin\b", r"\bbtc\b", r"\bбиткоин\b", r"\b比特币\b",
-    r"\bethereum\b", r"\beth\b", r"\bэфир\b", r"\b以太坊\b",
-    r"\bbinance coin\b", r"\bbnb\b", r"\busdt\b", r"\btether\b",
-    r"\bxrp\b", r"\bripple\b", r"\bcardano\b", r"\bada\b",
-    r"\bsolana\b", r"\bsol\b", r"\bdoge\b", r"\bdogecoin\b",
-    r"\bavalanche\b", r"\bavax\b", r"\bpolkadot\b", r"\bdot\b",
-    r"\bchainlink\b", r"\blink\b", r"\btron\b", r"\btrx\b",
-    r"\bcbdc\b", r"\bcentral bank digital currency\b", r"\bцифровой рубль\b",
-    r"\bdigital yuan\b", r"\beuro digital\b", r"\bdefi\b", r"\bдецентрализованные финансы\b",
-    r"\bnft\b", r"\bnon-fungible token\b", r"\bsec\b", r"\bцб рф\b",
-    r"\bрегуляция\b", r"\bregulation\b", r"\bзапрет\b", r"\bban\b",
-    r"\bмайнинг\b", r"\bmining\b", r"\bhalving\b", r"\bхалвинг\b",
-    r"\bволатильность\b", r"\bvolatility\b", r"\bcrash\b", r"\bкрах\b",
-    r"\b刚刚\b", r"\bدقائق مضت\b",
-    # === Пандемия и болезни (включая биобезопасность) ===
-    r"\bpandemic\b", r"\bпандемия\b", r"\b疫情\b", r"\bجائحة\b",
-    r"\boutbreak\b", r"\bвспышка\b", r"\bэпидемия\b", r"\bepidemic\b",
-    r"\bvirus\b", r"\bвирус\b", r"\bвирусы\b", r"\b变异株\b",
-    r"\bvaccine\b", r"\bвакцина\b", r"\b疫苗\b", r"\bلقاح\b",
-    r"\bbooster\b", r"\bбустер\b", r"\bревакцинация\b",
-    r"\bquarantine\b", r"\bкарантин\b", r"\b隔离\b", r"\bحجر صحي\b",
-    r"\blockdown\b", r"\bлокдаун\b", r"\b封锁\b",
-    r"\bmutation\b", r"\bмутация\b", r"\b变异\b",
-    r"\bstrain\b", r"\bштамм\b", r"\bomicron\b", r"\bdelta\b",
-    r"\bbiosafety\b", r"\bбиобезопасность\b", r"\b生物安全\b",
-    r"\blab leak\b", r"\bлабораторная утечка\b", r"\b实验室泄漏\b",
-    r"\bgain of function\b", r"\bусиление функции\b",
-    r"\bwho\b", r"\bвоз\b", r"\bcdc\b", r"\bроспотребнадзор\b",
-    r"\binfection rate\b", r"\bзаразность\b", r"\b死亡率\b",
-    r"\bhospitalization\b", r"\bгоспитализация\b",
-    r"\bقبل ساعات\b", r"\b刚刚报告\b"
+# Источники RSS
+RSS_SOURCES = [
+    {"name": "Atlantic Council", "url": "https://www.atlanticcouncil.org/feed/"},
+    {"name": "Chatham House", "url": "https://www.chathamhouse.org/rss.xml"},
+    {"name": "RAND Corporation", "url": "https://www.rand.org/rss.xml"},
+    {"name": "E3G", "url": "https://www.e3g.org/feed/"},
+    {"name": "Foreign Affairs", "url": "https://www.foreignaffairs.com/rss.xml"},
+    {"name": "CFR", "url": "https://www.cfr.org/rss/"},
+    {"name": "The Economist", "url": "https://www.economist.com/latest/rss.xml"},
+    {"name": "Bloomberg Politics", "url": "https://www.bloomberg.com/politics/feeds/site.xml"},
 ]
-KEYWORDS = [re.compile(kw, re.IGNORECASE) for kw in KEYWORDS_RAW]
-SOURCES = {
-    "E3G": "https://www.e3g.org/feed/",
-    "Foreign Affairs": "https://www.foreignaffairs.com/rss/topics/russia-and-former-soviet-republics/feed",
-    "Reuters Inst": "https://reutersinstitute.politics.ox.ac.uk/rss.xml",
-    "Bruegel": "https://www.bruegel.org/feed",
-    "Chatham House": "https://www.chathamhouse.org/topics/russia-and-eurasia/rss",
-    "CSIS": "https://www.csis.org/regions/russia-and-eurasia/rss.xml",
-    "Atlantic Council": "https://www.atlanticcouncil.org/region/eurasia/feed/",
-    "RAND": "https://www.rand.org/pubs.rss",
-    "CFR": "https://www.cfr.org/rss/publication/by_region/russia-and-eurasia/rss.xml",
-    "Carnegie": "https://carnegieendowment.org/rss/topic/R23",
-    "The Economist": "https://www.economist.com/europe/rss.xml",
-    "Bloomberg": "https://feeds.bloomberg.com/politics/rss.xml",
-    "J. Hopkins CHS": "https://www.centerforhealthsecurity.org/news/rss/",
-    "Metaculus": "https://www.metaculus.com/news/rss/",
-    "WEF": "https://www.weforum.org/feed",
-    "BBC Future": "https://www.bbc.com/feed/future",
-    "Future Timeline": "https://www.futuretimeline.net/blog/rss.xml",
-}
 
+# HTML-источники
+HTML_SOURCES = [
+    {"n": "Good Judgment", "u": "https://goodjudgment.com/open-questions/", "s": ".question-title a", "b": "https://goodjudgment.com"},
+    {"n": "Johns Hopkins", "u": "https://centerforhealthsecurity.org/news/", "s": "h3.post-title a", "b": "https://centerforhealthsecurity.org"},
+    {"n": "Metaculus", "u": "https://www.metaculus.com/news/", "s": "h2.article-title a", "b": "https://www.metaculus.com"},
+    {"n": "RAND Pubs", "u": "https://www.rand.org/pubs.html", "s": "h3.pub-title a", "b": "https://www.rand.org"},
+    {"n": "WEF", "u": "https://www.weforum.org/agenda/", "s": "h3[data-module='article-title'] a", "b": "https://www.weforum.org"},
+    {"n": "CSIS", "u": "https://www.csis.org/analysis", "s": "h3.field--name-title a", "b": "https://www.csis.org"},
+    {"n": "Economist", "u": "https://www.economist.com", "s": "h3.teaser__headline a", "b": "https://www.economist.com"},
+    {"n": "Bloomberg", "u": "https://www.bloomberg.com", "s": "h3.storyItem__headline a", "b": "https://www.bloomberg.com"},
+    {"n": "Carnegie", "u": "https://carnegieendowment.org/publications", "s": "h3.pub-title a", "b": "https://carnegieendowment.org"},
+    {"n": "Bruegel", "u": "https://www.bruegel.org/publications", "s": "h3.publication-title a", "b": "https://www.bruegel.org"},
+]
 
-# --- 4. Вспомогательные функции ---
+# Ключевые слова
+KEYWORDS = [
+    r"\brussia\b", r"\brussian\b", r"\bputin\b", r"\bukraine\b", r"\bzelensky\b",
+    r"\bmoscow\b", r"\bkyiv\b", r"\bsanction[s]?\b", r"\bnato\b", r"\bwar\b",
+    r"\bmilitary\b", r"\bkremlin\b", r"\bcrimea\b", r"\bdrone\b", r"\bnuclear\b",
+    r"\bgas\b", r"\boil\b", r"\beuropa\b", r"\bgermany\b", r"\bfrance\b",
+    r"\busa\b", r"\buk\b", r"\bbritain\b", r"\bpoland\b", r"\bestonia\b",
+    r"\blatvia\b", r"\blithuania\b", r"\bchinese\b", r"\bchina\b", r"\bxi\b",
+    r"\bepidemic\b", r"\bpandemic\b", r"\bvirus\b", r"\bvaccine\b", r"\bai\b",
+    r"\bartificial intelligence\b", r"\bcrypto\b", r"\bbitcoin\b", r"\beth\b",
+    r"\bclimate\b", r"\bglobal warming\b", r"\bextremism\b", r"\bterrorism\b"
+]
 
-# УДАЛЕНЫ: load_processed_guids() и save_processed_guids()
+MAX_PER_RUN = 10
+CHECK_INTERVAL_MINUTES = 14
 
-def load_processed_guids_from_db(supabase: Client):
-    """ <<< НОВОЕ: Загружает ID из Supabase. """
-    try:
-        response = supabase.table('processed_articles').select('guid').execute()
-        return set([row['guid'] for row in response.data])
-    except Exception as e:
-        logging.error(f"Could not load GUIDs from Supabase: {e}")
-        return set() # Начинаем с пустым набором в случае ошибки
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
-def save_guid_to_db(supabase: Client, guid: str):
-    """ <<< НОВОЕ: Сохраняет один ID в Supabase. """
-    try:
-        # upsert=True - на случай, если мы пытаемся добавить то, что уже есть
-        supabase.table('processed_articles').insert({"guid": guid}, upsert=True).execute()
-    except Exception as e:
-        # Мы логируем ошибку, но не останавливаемся.
-        # Primary Key constraint в базе данных всё равно не даст вставить дубликат.
-        logging.error(f"Failed to save GUID {guid} to Supabase: {e}")
-
-# (escape_markdown_v2, translate_text, get_real_lead, check_keywords, send_to_telegram
-# остаются БЕЗ ИЗМЕНЕНИЙ, как в прошлом файле)
-
-def escape_markdown_v2(text):
+def clean_text(text):
+    """Очистка текста от лишних пробелов и специальных символов"""
     if not text:
         return ""
-    escape_chars = r'\_*[]()~`>#+-=|{}.!'
-    text = re.sub(r'\\', r'\\\\', text)
-    for char in escape_chars:
-        text = text.replace(char, f"\\{char}")
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
-def translate_text(text, target_lang='ru', source_lang='en'):
-    if not text:
-        return None
+def translate_text(text):
+    """Перевод текста с fallback на разные сервисы"""
+    if not text or len(text.strip()) < 5:
+        return text
+        
     try:
-        translated = GoogleTranslator(source=source_lang, target=target_lang).translate(text)
+        # Используем Google Translator
+        translated = GoogleTranslator(source='auto', target='ru').translate(text[:2000])
         return translated
-    except Exception as e_google:
-        logging.warning(f"Google Translate failed: {e_google}. Trying MyMemory.")
+    except Exception as e1:
+        log.warning(f"Google Translate failed: {e1}")
         try:
-            translated = MyMemoryTranslator(source=source_lang, target=target_lang).translate(text)
+            # Fallback на MyMemory Translator
+            translated = MyMemoryTranslator(source='en', target='ru').translate(text[:2000])
             return translated
-        except Exception as e_memory:
-            logging.error(f"All translators failed for text: {text}. Error: {e_memory}")
-            return None
+        except Exception as e2:
+            log.warning(f"MyMemoryTranslator failed: {e2}")
+            # Если оба переводчика не работают, возвращаем оригинальный текст
+            return text
 
-def get_real_lead(html_description):
-    if not html_description:
-        return None
-    soup = BeautifulSoup(html_description, 'html.parser')
-    first_p = soup.find('p')
-    if first_p:
-        lead = first_p.get_text(strip=True)
-    else:
-        lead = soup.get_text(strip=True)
-        if '.' in lead:
-            lead = lead.split('.')[0] + '.'
-    if not lead or len(lead) < 20:
-        return None
-    lower_lead = lead.lower()
-    if "appeared first on" in lower_lead or \
-       "read more" in lower_lead or \
-       "©" in lower_lead or \
-       "click here" in lower_lead:
-        logging.info(f"Skipping article, template lead found: {lead[:50]}...")
-        return None
-    return lead
+def get_source_prefix(name):
+    """Получение короткого названия источника"""
+    prefixes = {
+        "Atlantic Council": "ATLANTICCOUNCIL",
+        "Chatham House": "CHATHAMHOUSE",
+        "RAND Corporation": "RAND",
+        "RAND Pubs": "RAND",
+        "E3G": "E3G",
+        "Foreign Affairs": "FOREIGNAFFAIRS",
+        "CFR": "CFR",
+        "The Economist": "ECONOMIST",
+        "Bloomberg": "BLOOMBERG",
+        "Bloomberg Politics": "BLOOMBERG",
+        "WEF": "WEF",
+        "CSIS": "CSIS",
+        "Good Judgment": "GOODJUDGMENT",
+        "Johns Hopkins": "JHUCSSE",
+        "Metaculus": "METACULUS",
+        "Carnegie": "CARNEGIE",
+        "Bruegel": "BRUEGEL",
+        "Economist": "ECONOMIST"
+    }
+    return prefixes.get(name, name.upper())
 
-def check_keywords(text):
-    if not text:
-        return False
-    for kw_regex in KEYWORDS:
-        if kw_regex.search(text):
-            return True
-    return False
+def parse_rss_feed(url):
+    """Парсинг RSS-ленты через BeautifulSoup"""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        if response.status_code != 200:
+            log.error(f"❌ Ошибка загрузки RSS {url}: статус {response.status_code}")
+            return []
+        
+        # Парсим как XML
+        soup = BeautifulSoup(response.content, "xml")
+        
+        # Ищем элементы <item> или <entry>
+        items = soup.find_all("item") or soup.find_all("entry")
+        return items
+    except Exception as e:
+        log.error(f"❌ Ошибка парсинга RSS {url}: {e}")
+        return []
 
-def send_to_telegram(message_text, bot_instance, target_channels):
-    for channel_id in target_channels:
-        try:
-            bot_instance.send_message(
-                chat_id=channel_id,
-                text=message_text,
-                parse_mode="MarkdownV2",
-                disable_web_page_preview=True
-            )
-            logging.info(f"Successfully sent message to {channel_id}")
-            time.sleep(1) 
-        except Exception as e:
-            logging.error(f"Failed to send message to {channel_id}: {e}")
-            logging.error(f"Message content (raw): {message_text}")
-
-
-# --- 5. Основная логика парсинга (обновлена) ---
-
-def process_feeds(bot_instance: telegram.Bot, supabase: Client):
-    """ <<< ИЗМЕНЕНО: Принимает 'supabase' клиент. """
-    logging.info("--- Starting new feed processing cycle ---")
+def extract_lead_from_html(html_content):
+    """Извлечение лид-текста из HTML"""
+    if not html_content:
+        return ""
     
-    # <<< ИЗМЕНЕНО: Загружаем из Supabase
-    processed_guids = load_processed_guids_from_db(supabase)
-    
-    new_articles_found = 0
-    
-    for prefix, url in SOURCES.items():
-        logging.info(f"Parsing source: {prefix} ({url})")
-        try:
-            feed = feedparser.parse(url)
-        except Exception as e:
-            logging.error(f"Could not parse feed {prefix}: {e}")
-            continue
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        # Удаляем ненужные элементы
+        for elem in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            elem.decompose()
+        
+        # Ищем первый абзац
+        first_p = soup.find("p")
+        if first_p:
+            return clean_text(first_p.get_text())
+        
+        # Если нет абзацев, берем весь текст и делим на предложения
+        text = clean_text(soup.get_text())
+        if not text:
+            return ""
+        
+        # Делим на предложения и берем первые два
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        lead = " ".join(sentences[:2]).strip()
+        return lead + "..." if len(sentences) > 2 else lead
+    except Exception as e:
+        log.error(f"❌ Ошибка извлечения лид-текста: {e}")
+        return ""
 
-        for entry in feed.entries:
-            guid = entry.get('id', entry.link)
+def fetch_news():
+    """Сбор новостей из RSS и HTML источников"""
+    result = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    # === 1. Обработка RSS-источников ===
+    for src in RSS_SOURCES:
+        if len(result) >= MAX_PER_RUN:
+            break
             
-            if not guid or guid in processed_guids:
-                continue
-
-            title = entry.get('title', '')
-            link = entry.get('link', '')
-            description = entry.get('description', entry.get('summary', ''))
+        try:
+            log.info(f"📡 RSS {src['name']}: {src['url']}")
+            items = parse_rss_feed(src["url"].strip())
             
-            text_to_check = title + " " + description
-            if not check_keywords(text_to_check):
-                continue
+            for item in items[:10]:
+                if len(result) >= MAX_PER_RUN:
+                    break
                 
-            logging.info(f"Found keyword match in '{title[:50]}...'")
-
-            lead = get_real_lead(description)
-            if not lead:
-                save_guid_to_db(supabase, guid) # Сохраняем "мусорный" guid, чтобы не проверять
-                continue
-
-            translated_title = translate_text(title)
-            translated_lead = translate_text(lead)
-
-            if not translated_title or not translated_lead:
-                logging.warning(f"Translation failed for '{title}'. Skipping.")
-                save_guid_to_db(supabase, guid) # Сохраняем, чтобы не пытаться перевести снова
-                continue
-
-            parsed_link = urlparse(link)
-            clean_link = f"{parsed_link.scheme}://{parsed_link.netloc}{parsed_link.path}"
-
-            esc_prefix = escape_markdown_v2(prefix)
-            esc_title = escape_markdown_v2(translated_title)
-            esc_lead = escape_markdown_v2(translated_lead)
-            esc_link = escape_markdown_v2(clean_link)
-
-            message = f"*{esc_prefix}*: {esc_title}\n\n{esc_lead}\n\n:Источник:({esc_link})"
-
-            send_to_telegram(message, bot_instance, CHANNEL_IDS)
+                # Извлекаем заголовок и ссылку
+                title = clean_text(item.title.get_text() if item.title else "")
+                link = clean_text(item.link.get_text() if item.link else (item.guid.get_text() if item.guid else ""))
+                
+                if not title or not link:
+                    continue
+                
+                # Проверяем на дубликаты
+                if is_seen(link, title):
+                    continue
+                
+                # Фильтрация по ключевым словам
+                if not any(re.search(kw, title, re.IGNORECASE) for kw in KEYWORDS):
+                    continue
+                
+                # Извлекаем лид-текст
+                desc = clean_text(item.description.get_text() if item.description else "")
+                content = clean_text(item.content.get_text() if hasattr(item, "content") and item.content else "")
+                lead = desc or content or title
+                
+                # Ограничиваем лид двумя предложениями
+                sentences = re.split(r'(?<=[.!?])\s+', lead)
+                if len(sentences) > 2:
+                    lead = ' '.join(sentences[:2]).rstrip() + "…"
+                else:
+                    lead = lead.rstrip()
+                
+                # Переводим на русский
+                ru_title = translate_text(title)
+                ru_lead = translate_text(lead)
+                
+                # Формируем сообщение
+                prefix = get_source_prefix(src["name"])
+                safe_prefix = html.escape(prefix)
+                safe_title = html.escape(ru_title)
+                safe_lead = html.escape(ru_lead)
+                safe_link = html.escape(link)
+                
+                msg = f"<b>{safe_prefix}</b>: {safe_title}\n\n{safe_lead}\n\nИсточник: {safe_link}"
+                result.append({"msg": msg, "link": link, "title": title})
+                log.info(f"✅ Найдена релевантная новость из RSS {src['name']}: {title[:50]}...")
+                
+        except Exception as e:
+            log.error(f"❌ Ошибка обработки RSS {src['name']}: {e}")
+            log.error(traceback.format_exc())
+    
+    # === 2. Обработка HTML-источников ===
+    for src in HTML_SOURCES:
+        if len(result) >= MAX_PER_RUN:
+            break
             
-            # <<< ИЗМЕНЕНО: Сохраняем в Supabase
-            save_guid_to_db(supabase, guid)
-            processed_guids.add(guid) # Добавляем в локальный набор, чтобы не дублировать в этом же цикле
-            new_articles_found += 1
+        try:
+            base_url = src["b"].rstrip("/")
+            page_url = src["u"].strip()
+            selector = src["s"]
+            log.info(f"🌐 HTML {src['n']}: {page_url}")
             
-            # <<< УДАЛЕНО: save_processed_guids(processed_guids)
-
-    logging.info(f"--- Feed processing cycle finished. Found {new_articles_found} new articles. ---")
-
-# --- 6. Настройка Веб-сервера (Flask) и Планировщика (Schedule) ---
-
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Bot is running...", 200
-
-def run_scheduler():
-    logging.info("Scheduler started.")
+            response = requests.get(page_url, headers=headers, timeout=20)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, "html.parser")
+            items = soup.select(selector)
+            
+            for item in items[:10]:
+                if len(result) >= MAX_PER_RUN:
+                    break
+                
+                a_tag = item if item.name == 'a' else item.find('a')
+                if not a_tag or not a_tag.get_text(strip=True):
+                    continue
+                
+                link = a_tag.get('href', '').strip()
+                title = clean_text(a_tag.get_text())
+                
+                # Нормализуем URL
+                if link.startswith('/'):
+                    link = base_url + link
+                elif not link.startswith('http'):
+                    continue
+                
+                if not title:
+                    continue
+                
+                # Проверяем на дубликаты
+                if is_seen(link, title):
+                    continue
+                
+                # Фильтрация по ключевым словам
+                if not any(re.search(kw, title, re.IGNORECASE) for kw in KEYWORDS):
+                    continue
+                
+                # Для HTML-источников используем заголовок как лид
+                ru_title = translate_text(title)
+                ru_lead = ru_title
+                
+                # Формируем сообщение
+                safe_prefix = html.escape(src["n"])
+                safe_title = html.escape(ru_title)
+                safe_lead = html.escape(ru_lead)
+                safe_link = html.escape(link)
+                
+                msg = f"<b>{safe_prefix}</b>: {safe_title}\n\n{safe_lead}\n\nИсточник: {safe_link}"
+                result.append({"msg": msg, "link": link, "title": title})
+                log.info(f"✅ Найдена релевантная новость из HTML {src['n']}: {title[:50]}...")
+                
+        except Exception as e:
+            log.error(f"❌ Ошибка обработки HTML {src['n']}: {e}")
+            log.error(traceback.format_exc())
     
-    # --- Инициализация Бота и Supabase ---
-    if not TELEGRAM_BOT_TOKEN or not CHANNEL_IDS:
-        logging.critical("Telegram TOKEN or CHANNEL_IDs not found!")
-        return
-        
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logging.critical("Supabase URL or KEY not found!")
-        return
-        
+    return result
+
+def send_to_telegram(text):
+    """Отправка сообщения в Telegram"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    
     try:
-        bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-        bot_info = bot.get_me()
-        logging.info(f"Telegram Bot initialized: {bot_info.username}")
-    except Exception as e:
-        logging.critical(f"Failed to initialize Telegram Bot: {e}")
-        return
-
-    # <<< НОВОЕ: Инициализируем Supabase клиент
-    try:
-        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logging.info("Supabase client initialized.")
-    except Exception as e:
-        logging.critical(f"Failed to initialize Supabase client: {e}")
-        return
-    
-    # <<< ИЗМЕНЕНО: Привязываем 'bot' и 'supabase'
-    def job():
-        process_feeds(bot, supabase)
+        log.info("📤 Отправка сообщения в Telegram...")
+        response = requests.post(url, data=payload, timeout=15)
         
-    logging.info("Running initial job...")
-    job()
+        if response.status_code == 200:
+            log.info("✅ Сообщение успешно отправлено")
+            return True
+        else:
+            log.error(f"❌ Ошибка Telegram ({response.status_code}): {response.text}")
+            return False
+    except Exception as e:
+        log.error(f"❌ Исключение при отправке в Telegram: {e}")
+        return False
+
+def job_main():
+    """Основная задача проверки новостей"""
+    try:
+        log.info("🔄 Запуск основной проверки новостей...")
+        news = fetch_news()
+        
+        if not news:
+            log.info("📭 Нет релевантных новостей для отправки")
+            return
+        
+        log.info(f"📬 Найдено {len(news)} релевантных новостей")
+        
+        for i, item in enumerate(news, 1):
+            log.info(f"📨 Отправка новости {i}/{len(news)}: {item['title'][:50]}...")
+            if send_to_telegram(item["msg"]):
+                mark_seen(item["link"], item["title"])
+                log.info(f"✅ Новость успешно отправлена и сохранена")
+            time.sleep(2)  # Задержка между отправками
+            
+    except Exception as e:
+        log.error("🚨 Критическая ошибка в job_main")
+        log.error(traceback.format_exc())
+
+def job_keepalive():
+    """Фоновая задача для keep-alive"""
+    log.info("💤 Keep-alive check")
+
+# ================== HTTP сервер для Render ==================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"OK - Bot is alive")
     
-    schedule.every(10).minutes.do(job)
+    def log_message(self, format, *args):
+        pass
+
+def start_http_server():
+    """Запуск HTTP сервера для health checks"""
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info(f"🌐 HTTP сервер запущен на порту {port}")
+    server.serve_forever()
+
+# ================== MAIN ==================
+if __name__ == "__main__":
+    log.info("🚀 Запуск бота")
     
+    # Запускаем HTTP сервер в фоновом режиме
+    http_thread = threading.Thread(target=start_http_server, daemon=True)
+    http_thread.start()
+    
+    # Первый запуск немедленно
+    job_main()
+    
+    # Настройка расписания
+    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(job_main)
+    schedule.every(10).minutes.do(job_keepalive)
+    
+    log.info(f"⏰ Расписание настроено: проверка каждые {CHECK_INTERVAL_MINUTES} минут")
+    
+    # Основной цикл
     while True:
         schedule.run_pending()
         time.sleep(1)
-
-def run_server():
-    logging.info(f"Starting Flask server on port {PORT}...")
-    app.run(host='0.0.0.0', port=PORT)
-
-# --- 7. Запуск ---
-if __name__ == "__main__":
-    server_thread = threading.Thread(target=run_server, daemon=True)
-    server_thread.start()
-    run_scheduler()
